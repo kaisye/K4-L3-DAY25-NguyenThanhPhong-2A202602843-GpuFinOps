@@ -6,6 +6,20 @@ live prices as fast-moving (re-baseline before each cohort).
 from __future__ import annotations
 
 
+# Illustrative per-hour interruption probabilities.  They are deliberately kept
+# next to the policy (rather than hidden in a mission) so callers can override
+# them when a provider publishes fresher observations.
+SPOT_INTERRUPTION_RATE = {
+    "H100": 0.03,
+    "H200": 0.04,
+    "A100": 0.05,
+    "A10G": 0.10,
+    "L4": 0.08,
+    "B200": 0.06,
+    "MI300X": 0.07,
+}
+
+
 def request_cost(
     input_tok: int,
     output_tok: int,
@@ -52,6 +66,30 @@ def discount_stack(
     return cache_mult * batch_mult
 
 
+def cache_break_even_reads(write_cost_per_m: float, read_discount: float = 0.10) -> float:
+    """Return cache reads needed to recover the one-time cache-write premium.
+
+    ``write_cost_per_m`` is expressed as a multiple of the normal uncached
+    input-token price.  A value of 1.25 therefore means that writing one token
+    costs 1.25 normal reads.  Each cached read saves ``1-read_discount`` normal
+    reads, hence the break-even equation is ``write / saving_per_read``.
+    """
+    if not 0 <= read_discount < 1:
+        raise ValueError("read_discount must be in [0, 1)")
+    return max(0.0, write_cost_per_m) / (1.0 - read_discount)
+
+
+def cache_is_worth_it(
+    avg_cache_reads: float,
+    write_cost_per_m: float,
+    read_discount: float = 0.10,
+) -> bool:
+    """Whether expected cache-read savings exceed the cache-write premium."""
+    return max(0.0, avg_cache_reads) > cache_break_even_reads(
+        write_cost_per_m, read_discount
+    )
+
+
 def break_even_utilization(discount_frac: float) -> float:
     """Utilization at which a commitment pays off ~= 1 - discount.
 
@@ -60,21 +98,55 @@ def break_even_utilization(discount_frac: float) -> float:
     return max(0.0, min(1.0, 1.0 - discount_frac))
 
 
-def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount: float = 0.45) -> str:
+def recommend_tier(
+    hours_per_day: float,
+    interruptible: bool,
+    reserved_discount: float = 0.45,
+    gpu_type: str | None = None,
+    job_days: int | None = None,
+    interruption_rate: float | None = None,
+    max_spot_interruption_rate: float = 0.10,
+) -> str:
     """Pick a purchasing tier from a workload's duty cycle + interruptibility.
 
-    DOCUMENTED simple policy (instructor extension point — swap in your own):
-      - interruptible & not 24/7  -> 'spot'      (checkpoint and ride the discount)
-      - duty cycle >= break-even  -> 'reserved'  (steady, high utilization)
-      - otherwise                 -> 'on_demand' (spiky / low duty)
+    Policy considers duty cycle, workload duration, and GPU-specific spot risk:
+      - checkpointable, finite work whose interruption risk is acceptable -> spot
+      - steady non-interruptible work lasting >=30 days -> reserved
+      - short-lived or low-duty non-interruptible work -> on-demand
+
+    The returned value remains backward-compatible (``reserved`` rather than a
+    term-specific spelling).  Use :func:`recommend_reserved_term` to choose the
+    1-year versus 3-year contract.
     """
     duty = max(0.0, hours_per_day) / 24.0
     be = break_even_utilization(reserved_discount)
-    if interruptible and hours_per_day < 24:
+    if interruption_rate is None:
+        interruption_rate = SPOT_INTERRUPTION_RATE.get(gpu_type or "", 0.05)
+    finite_job = job_days is None or job_days < 365
+    if (interruptible and finite_job and hours_per_day < 24
+            and interruption_rate <= max_spot_interruption_rate):
         return "spot"
-    if duty >= be:
+    long_enough_to_commit = job_days is None or job_days >= 30
+    if duty >= be and long_enough_to_commit:
         return "reserved"
     return "on_demand"
+
+
+def recommend_reserved_term(
+    job_days: int | None,
+    reserved_1yr_hr: float,
+    reserved_3yr_hr: float,
+) -> str:
+    """Choose a commitment term without pretending a short job lasts for years.
+
+    A three-year price is only selected when the forecast horizon covers three
+    years.  A recurring workload with at least a one-month observation window is
+    conservatively assigned the more flexible one-year rate; truly short work
+    should remain on-demand.
+    """
+    if job_days is not None and job_days >= 3 * 365 and reserved_3yr_hr < reserved_1yr_hr:
+        return "reserved_3yr"
+    return "reserved_1yr"
 
 
 def spot_checkpoint_cost(

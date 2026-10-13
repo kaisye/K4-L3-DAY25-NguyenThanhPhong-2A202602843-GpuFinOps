@@ -17,13 +17,22 @@ TAGS = ["team", "project"]
 
 def run(verbose: bool = True) -> dict:
     rows = load_csv("token_usage.csv")
+    group_reads = {}
+    for r in rows:
+        key = (r["route_tier"], r["project"] or r["team"])
+        if int(num(r["cached_input_tokens"])) > 0:
+            group_reads[key] = group_reads.get(key, 0) + 1
     priced = []
     for r in rows:
         inp, out = int(num(r["input_tokens"])), int(num(r["output_tokens"]))
         pin, pout = MODEL_PRICES[r["route_tier"]]
+        key = (r["route_tier"], r["project"] or r["team"])
+        reads = group_reads.get(key, 0)
+        cached = int(num(r["cached_input_tokens"])) if pricing.cache_is_worth_it(reads, 1.25) else 0
         cost = pricing.request_cost(inp, out, pin, pout,
-                                    cached_in=int(num(r["cached_input_tokens"])),
+                                    cached_in=cached,
                                     batch=bool(int(num(r["is_batch"]))))
+        cost += cached / 1e6 * pin * 1.25 / max(1, reads)
         priced.append({"team": r["team"], "project": r["project"],
                        "service": "gpu-inference", "cost": cost})
 
@@ -37,7 +46,7 @@ def run(verbose: bool = True) -> dict:
     out_path = os.path.join(ROOT, "outputs", "focus_export.csv")
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w", newline="") as f:
-        w = csv.writer(f)
+        w = csv.writer(f, lineterminator="\n")
         w.writerow(["BillingAccountId", "ChargePeriodStart", "ServiceCategory",
                     "ServiceName", "ResourceId", "BilledCost", "BillingCurrency", "team", "project"])
         for fr in focus:
